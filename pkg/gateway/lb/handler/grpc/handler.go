@@ -27,7 +27,6 @@ import (
 	"time"
 
 	"github.com/kpango/fuid"
-	agent "github.com/vdaas/vald/apis/grpc/agent/core"
 	"github.com/vdaas/vald/apis/grpc/gateway/vald"
 	"github.com/vdaas/vald/apis/grpc/payload"
 	"github.com/vdaas/vald/internal/errgroup"
@@ -44,10 +43,7 @@ import (
 type server struct {
 	eg                errgroup.Group
 	gateway           service.Gateway
-	metadata          service.Meta
-	backup            service.Backup
 	timeout           time.Duration
-	filter            service.Filter
 	replica           int
 	streamConcurrency int
 }
@@ -61,71 +57,90 @@ func New(opts ...Option) vald.ValdServer {
 	return s
 }
 
-func (s *server) Exists(ctx context.Context, meta *payload.Object_ID) (*payload.Object_ID, error) {
-	ctx, span := trace.StartSpan(ctx, "vald/gateway-vald.Exists")
+func (s *server) Exists(ctx context.Context, meta *payload.Object_ID) (id *payload.Object_ID, err error) {
+	ctx, span := trace.StartSpan(ctx, "vald/gateway-lb.Exists")
 	defer func() {
 		if span != nil {
 			span.End()
 		}
 	}()
-	uuid, err := s.metadata.GetUUID(ctx, meta.GetId())
-	if err != nil {
+	var cancel context.CancelFunc
+	ctx, cancel = context.WithCancel(ctx)
+	var once sync.Once
+	err = s.gateway.BroadCast(ctx, func(ctx context.Context, tgt string, vc vald.ValdClient, copts ...grpc.CallOption) error {
+		oid, err := vc.Exists(ctx, meta, copts...)
+		if err != nil {
+			return nil
+		}
+		if oid != nil && oid.Id != "" {
+			once.Do(func() {
+				id = new(payload.Object_ID)
+				id.Id = oid.Id
+				cancel()
+			})
+		}
+		return nil
+	})
+	if err != nil || id == nil || id.Id == "" {
 		if span != nil {
 			span.SetStatus(trace.StatusCodeNotFound(err.Error()))
 		}
 		return nil, status.WrapWithNotFound(fmt.Sprintf("Exists API meta %s's uuid not found", meta.GetId()), err, meta.GetId(), info.Get())
 	}
-	return &payload.Object_ID{
-		Id: uuid,
-	}, nil
+	return id, nil
 }
 
 func (s *server) Search(ctx context.Context, req *payload.Search_Request) (res *payload.Search_Response, err error) {
-	ctx, span := trace.StartSpan(ctx, "vald/gateway-vald.Search")
+	ctx, span := trace.StartSpan(ctx, "vald/gateway-lb.Search")
 	defer func() {
 		if span != nil {
 			span.End()
 		}
 	}()
+	if len(req.Vector) < 2 {
+		err = errors.ErrInvalidDimensionSize(len(req.Vector), 0)
+		if span != nil {
+			span.SetStatus(trace.StatusCodeInvalidArgument(err.Error()))
+		}
+		return nil, status.WrapWithInvalidArgument("Search API invalid vector argument", err, req, info.Get())
+	}
 	return s.search(ctx, req.GetConfig(),
-		func(ctx context.Context, ac agent.AgentClient, copts ...grpc.CallOption) (*payload.Search_Response, error) {
-			return ac.Search(ctx, req, copts...)
+		func(ctx context.Context, vc vald.ValdClient, copts ...grpc.CallOption) (*payload.Search_Response, error) {
+			return vc.Search(ctx, req, copts...)
 		})
 }
 
 func (s *server) SearchByID(ctx context.Context, req *payload.Search_IDRequest) (
 	res *payload.Search_Response, err error) {
-	ctx, span := trace.StartSpan(ctx, "vald/gateway-vald.SearchByID")
+	ctx, span := trace.StartSpan(ctx, "vald/gateway-lb.SearchByID")
 	defer func() {
 		if span != nil {
 			span.End()
 		}
 	}()
-	metaID := req.GetId()
-	req.Id, err = s.metadata.GetUUID(ctx, metaID)
-	if err != nil {
-		req.Id = metaID
-		log.Errorf("error at SearchByID\t%v", err)
+	if len(req.GetId()) == 0 {
+		err = errors.ErrInvalidMetaDataConfig
 		if span != nil {
-			span.SetStatus(trace.StatusCodeNotFound(err.Error()))
+			span.SetStatus(trace.StatusCodeInvalidArgument(err.Error()))
 		}
-		return nil, status.WrapWithNotFound(fmt.Sprintf("SearchByID API meta %s's uuid not found", metaID), err, req, info.Get())
+		return nil, status.WrapWithInvalidArgument("SearchByID API invalid uuid", err, req, info.Get())
 	}
 	return s.search(ctx, req.GetConfig(),
-		func(ctx context.Context, ac agent.AgentClient, copts ...grpc.CallOption) (*payload.Search_Response, error) {
-			return ac.SearchByID(ctx, req, copts...)
+		func(ctx context.Context, vc vald.ValdClient, copts ...grpc.CallOption) (*payload.Search_Response, error) {
+			return vc.SearchByID(ctx, req, copts...)
 		})
 }
 
 func (s *server) search(ctx context.Context, cfg *payload.Search_Config,
-	f func(ctx context.Context, ac agent.AgentClient, copts ...grpc.CallOption) (*payload.Search_Response, error)) (
+	f func(ctx context.Context, vc vald.ValdClient, copts ...grpc.CallOption) (*payload.Search_Response, error)) (
 	res *payload.Search_Response, err error) {
-	ctx, span := trace.StartSpan(ctx, "vald/gateway-vald.search")
+	ctx, span := trace.StartSpan(ctx, "vald/gateway-lb.search")
 	defer func() {
 		if span != nil {
 			span.End()
 		}
 	}()
+
 	maxDist := uint32(math.MaxUint32)
 	num := int(cfg.GetNum())
 	res = new(payload.Search_Response)
@@ -146,8 +161,8 @@ func (s *server) search(ctx context.Context, cfg *payload.Search_Config,
 		// cl := new(checkList)
 		visited := make(map[string]bool, len(res.Results))
 		mu := sync.RWMutex{}
-		return s.gateway.BroadCast(ectx, func(ctx context.Context, target string, ac agent.AgentClient, copts ...grpc.CallOption) error {
-			r, err := f(ctx, ac, copts...)
+		return s.gateway.BroadCast(ectx, func(ctx context.Context, target string, vc vald.ValdClient, copts ...grpc.CallOption) error {
+			r, err := f(ctx, vc, copts...)
 			if err != nil {
 				log.Debug(err)
 				return nil
@@ -167,10 +182,6 @@ func (s *server) search(ctx context.Context, cfg *payload.Search_Config,
 				} else {
 					mu.RUnlock()
 				}
-				// if !cl.Exists(id) {
-				// 	dch <- dist
-				// 	cl.Check(id)
-				// }
 			}
 			return nil
 		})
@@ -183,35 +194,8 @@ func (s *server) search(ctx context.Context, cfg *payload.Search_Config,
 				log.Error(err)
 			}
 			close(dch)
-			if len(res.GetResults()) > num && num != 0 {
+			if num != 0 && len(res.GetResults()) > num {
 				res.Results = res.Results[:num]
-			}
-			uuids := make([]string, 0, len(res.Results))
-			for _, r := range res.Results {
-				uuids = append(uuids, r.GetId())
-			}
-			if s.metadata != nil {
-				metas, merr := s.metadata.GetMetas(ctx, uuids...)
-				if merr != nil {
-					log.Error(merr)
-					err = errors.Wrap(err, merr.Error())
-				}
-				for i, k := range metas {
-					if len(k) != 0 {
-						res.Results[i].Id = k
-					}
-				}
-			}
-			if s.filter != nil {
-				r, ferr := s.filter.FilterSearch(ctx, res)
-				if ferr == nil {
-					res = r
-				} else {
-					err = errors.Wrap(err, ferr.Error())
-				}
-			}
-			if err != nil {
-				return res, status.WrapWithInternal(fmt.Sprintf("failed to search request %#v", cfg), err, info.Get())
 			}
 			return res, nil
 		case dist := <-dch:
@@ -256,7 +240,7 @@ func (s *server) search(ctx context.Context, cfg *payload.Search_Config,
 }
 
 func (s *server) StreamSearch(stream vald.Vald_StreamSearchServer) error {
-	ctx, span := trace.StartSpan(stream.Context(), "vald/gateway-vald.StreamSearch")
+	ctx, span := trace.StartSpan(stream.Context(), "vald/gateway-lb.StreamSearch")
 	defer func() {
 		if span != nil {
 			span.End()
@@ -270,7 +254,7 @@ func (s *server) StreamSearch(stream vald.Vald_StreamSearchServer) error {
 }
 
 func (s *server) StreamSearchByID(stream vald.Vald_StreamSearchByIDServer) error {
-	ctx, span := trace.StartSpan(stream.Context(), "vald/gateway-vald.StreamSearchByID")
+	ctx, span := trace.StartSpan(stream.Context(), "vald/gateway-lb.StreamSearchByID")
 	defer func() {
 		if span != nil {
 			span.End()
@@ -283,45 +267,24 @@ func (s *server) StreamSearchByID(stream vald.Vald_StreamSearchByIDServer) error
 		})
 }
 
-func (s *server) Insert(ctx context.Context, vec *payload.Object_Vector) (ce *payload.Object_Locations, err error) {
-	ctx, span := trace.StartSpan(ctx, "vald/gateway-vald.Insert")
+func (s *server) Insert(ctx context.Context, vec *payload.Object_Vector) (ce *payload.Object_Location, err error) {
+	ctx, span := trace.StartSpan(ctx, "vald/gateway-lb.Insert")
 	defer func() {
 		if span != nil {
 			span.End()
 		}
 	}()
-	meta := vec.GetId()
-	exists, err := s.metadata.Exists(ctx, meta)
-	if err != nil {
-		log.Error(err)
+	if len(vec.Vector) < 2 {
+		err = errors.ErrInvalidDimensionSize(len(vec.Vector), 0)
 		if span != nil {
-			span.SetStatus(trace.StatusCodeInternal(err.Error()))
+			span.SetStatus(trace.StatusCodeInvalidArgument(err.Error()))
 		}
-		return nil, status.WrapWithInternal(
-			fmt.Sprintf("Insert API meta %s couldn't check meta already exists or not", meta), err, info.Get())
+		return nil, status.WrapWithInvalidArgument("Search API invalid vector argument", err, vec, info.Get())
 	}
-	if exists {
-		err = errors.Wrap(err, errors.ErrMetaDataAlreadyExists(meta).Error())
-		if span != nil {
-			span.SetStatus(trace.StatusCodeAlreadyExists(err.Error()))
-		}
-		return nil, status.WrapWithAlreadyExists(fmt.Sprintf("Insert API meta %s already exists", meta), err, info.Get())
-	}
-
-	uuid := fuid.String()
-	err = s.metadata.SetUUIDandMeta(ctx, uuid, meta)
-	if err != nil {
-		log.Error(err)
-		if span != nil {
-			span.SetStatus(trace.StatusCodeInternal(err.Error()))
-		}
-		return nil, status.WrapWithInternal(fmt.Sprintf("Insert API meta %s & uuid %s couldn't store", meta, uuid), err, info.Get())
-	}
-	vec.Id = uuid
 	mu := new(sync.Mutex)
 	targets := make([]string, 0, s.replica)
-	err = s.gateway.DoMulti(ctx, s.replica, func(ctx context.Context, target string, ac agent.AgentClient, copts ...grpc.CallOption) (err error) {
-		_, err = ac.Insert(ctx, vec, copts...)
+	err = s.gateway.DoMulti(ctx, s.replica, func(ctx context.Context, target string, vc vald.ValdClient, copts ...grpc.CallOption) (err error) {
+		_, err = vc.Insert(ctx, vec, copts...)
 		if err != nil {
 			if err == errors.ErrRPCCallFailed(target, context.Canceled) {
 				return nil
@@ -335,38 +298,22 @@ func (s *server) Insert(ctx context.Context, vec *payload.Object_Vector) (ce *pa
 		return nil
 	})
 	if err != nil {
-		err = errors.Wrapf(err, "Insert API (do multiple) failed to Insert uuid = %s\tmeta = %s\t info = %#v", uuid, meta, info.Get())
+		err = errors.Wrapf(err, "Insert API (do multiple) failed to Insert uuid = %s\t info = %#v", vec.GetId(), info.Get())
 		log.Error(err)
 		if span != nil {
 			span.SetStatus(trace.StatusCodeInternal(err.Error()))
 		}
 		return nil, status.WrapWithInternal(fmt.Sprintf("Insert API failed to Execute DoMulti error = %s", err.Error()), err, info.Get())
 	}
-	if s.backup != nil {
-		vecs := &payload.Object_Locations{
-			Uuid: uuid,
-			Meta: meta,
-			Ips:  targets,
-		}
-		if vec != nil {
-			vecs.Vector = vec.GetVector()
-		}
-		err = s.backup.Register(ctx, vecs)
-		if err != nil {
-			err = errors.Wrapf(err, "Insert API (backup.Register) failed to Backup Vectors = %#v\t info = %#v", vecs, info.Get())
-			log.Error(err)
-			if span != nil {
-				span.SetStatus(trace.StatusCodeInternal(err.Error()))
-			}
-			return nil, status.WrapWithInternal(err.Error(), err)
-		}
-	}
 	log.Debugf("Insert API insert succeeded to %v", targets)
-	return new(payload.Object_Locations), nil
+	return &payload.Object_Location{
+		Uuid: vec.GetId(),
+		Ips:  targets,
+	}, nil
 }
 
 func (s *server) StreamInsert(stream vald.Vald_StreamInsertServer) error {
-	ctx, span := trace.StartSpan(stream.Context(), "vald/gateway-vald.StreamInsert")
+	ctx, span := trace.StartSpan(stream.Context(), "vald/gateway-lb.StreamInsert")
 	defer func() {
 		if span != nil {
 			span.End()
@@ -380,7 +327,7 @@ func (s *server) StreamInsert(stream vald.Vald_StreamInsertServer) error {
 }
 
 func (s *server) MultiInsert(ctx context.Context, vecs *payload.Object_Vectors) (res *payload.Object_Locations, err error) {
-	ctx, span := trace.StartSpan(ctx, "vald/gateway-vald.MultiInsert")
+	ctx, span := trace.StartSpan(ctx, "vald/gateway-lb.MultiInsert")
 	defer func() {
 		if span != nil {
 			span.End()
@@ -425,8 +372,8 @@ func (s *server) MultiInsert(ctx context.Context, vecs *payload.Object_Vectors) 
 
 	mu := new(sync.Mutex)
 	targets := make([]string, 0, s.replica)
-	gerr := s.gateway.DoMulti(ctx, s.replica, func(ctx context.Context, target string, ac agent.AgentClient, copts ...grpc.CallOption) (err error) {
-		_, err = ac.MultiInsert(ctx, vecs, copts...)
+	gerr := s.gateway.DoMulti(ctx, s.replica, func(ctx context.Context, target string, vc vald.ValdClient, copts ...grpc.CallOption) (err error) {
+		_, err = vc.MultiInsert(ctx, vecs, copts...)
 		if err != nil {
 			return err
 		}
@@ -444,13 +391,12 @@ func (s *server) MultiInsert(ctx context.Context, vecs *payload.Object_Vectors) 
 	}
 
 	if s.backup != nil {
-		mvecs := new(payload.Object_Locationss)
-		mvecs.Vectors = make([]*payload.Object_Locations, 0, len(vecs.GetVectors()))
+		mvecs := new(payload.Backup_MetaVectors)
+		mvecs.Vectors = make([]*payload.Backup_MetaVector, 0, len(vecs.GetVectors()))
 		for _, vec := range vecs.GetVectors() {
 			uuid := vec.GetId()
-			mvecs.Vectors = append(mvecs.Vectors, &payload.Object_Locations{
+			mvecs.Vectors = append(mvecs.Vectors, &payload.Backup_MetaVector{
 				Uuid:   uuid,
-				Meta:   metaMap[uuid],
 				Vector: vec.GetVector(),
 				Ips:    targets,
 			})
@@ -466,8 +412,8 @@ func (s *server) MultiInsert(ctx context.Context, vecs *payload.Object_Vectors) 
 	return new(payload.Object_Locations), nil
 }
 
-func (s *server) Update(ctx context.Context, vec *payload.Object_Vector) (res *payload.Object_Locations, err error) {
-	ctx, span := trace.StartSpan(ctx, "vald/gateway-vald.Update")
+func (s *server) Update(ctx context.Context, vec *payload.Object_Vector) (res *payload.Object_Location, err error) {
+	ctx, span := trace.StartSpan(ctx, "vald/gateway-lb.Update")
 	defer func() {
 		if span != nil {
 			span.End()
@@ -493,11 +439,11 @@ func (s *server) Update(ctx context.Context, vec *payload.Object_Vector) (res *p
 	for _, loc := range locs {
 		lmap[loc] = struct{}{}
 	}
-	err = s.gateway.BroadCast(ctx, func(ctx context.Context, target string, ac agent.AgentClient, copts ...grpc.CallOption) error {
+	err = s.gateway.BroadCast(ctx, func(ctx context.Context, target string, vc vald.ValdClient, copts ...grpc.CallOption) error {
 		target = strings.SplitN(target, ":", 2)[0]
 		_, ok := lmap[target]
 		if ok {
-			_, err = ac.Update(ctx, vec, copts...)
+			_, err = vc.Update(ctx, vec, copts...)
 			if err != nil {
 				return err
 			}
@@ -510,13 +456,11 @@ func (s *server) Update(ctx context.Context, vec *payload.Object_Vector) (res *p
 		}
 		return nil, status.WrapWithInternal(fmt.Sprintf("Update API failed request %#v", vec), err, info.Get())
 	}
-	mvec := &payload.Object_Locations{
+	err = s.backup.Register(ctx, &payload.Backup_MetaVector{
 		Uuid:   uuid,
-		Meta:   meta,
 		Vector: vec.GetVector(),
 		Ips:    locs,
-	}
-	err = s.backup.Register(ctx, mvec)
+	})
 	if err != nil {
 		if span != nil {
 			span.SetStatus(trace.StatusCodeInternal(err.Error()))
@@ -524,11 +468,11 @@ func (s *server) Update(ctx context.Context, vec *payload.Object_Vector) (res *p
 		return nil, status.WrapWithInternal(fmt.Sprintf("Update API failed backup %#v", vec), err, info.Get())
 	}
 
-	return new(payload.Object_Locations), nil
+	return new(payload.Object_Location), nil
 }
 
 func (s *server) StreamUpdate(stream vald.Vald_StreamUpdateServer) error {
-	ctx, span := trace.StartSpan(stream.Context(), "vald/gateway-vald.StreamUpdate")
+	ctx, span := trace.StartSpan(stream.Context(), "vald/gateway-lb.StreamUpdate")
 	defer func() {
 		if span != nil {
 			span.End()
@@ -542,7 +486,7 @@ func (s *server) StreamUpdate(stream vald.Vald_StreamUpdateServer) error {
 }
 
 func (s *server) MultiUpdate(ctx context.Context, vecs *payload.Object_Vectors) (res *payload.Object_Locations, err error) {
-	ctx, span := trace.StartSpan(ctx, "vald/gateway-vald.MultiUpdate")
+	ctx, span := trace.StartSpan(ctx, "vald/gateway-lb.MultiUpdate")
 	defer func() {
 		if span != nil {
 			span.End()
@@ -571,8 +515,8 @@ func (s *server) MultiUpdate(ctx context.Context, vecs *payload.Object_Vectors) 
 	return new(payload.Object_Locations), nil
 }
 
-func (s *server) Upsert(ctx context.Context, vec *payload.Object_Vector) (*payload.Object_Locations, error) {
-	ctx, span := trace.StartSpan(ctx, "vald/gateway-vald.Upsert")
+func (s *server) Upsert(ctx context.Context, vec *payload.Object_Vector) (*payload.Object_Location, error) {
+	ctx, span := trace.StartSpan(ctx, "vald/gateway-lb.Upsert")
 	defer func() {
 		if span != nil {
 			span.End()
@@ -600,11 +544,11 @@ func (s *server) Upsert(ctx context.Context, vec *payload.Object_Vector) (*paylo
 		}
 	}
 
-	return new(payload.Object_Locations), errs
+	return new(payload.Object_Location), errs
 }
 
 func (s *server) StreamUpsert(stream vald.Vald_StreamUpsertServer) error {
-	ctx, span := trace.StartSpan(stream.Context(), "vald/gateway-vald.StreamUpsert")
+	ctx, span := trace.StartSpan(stream.Context(), "vald/gateway-lb.StreamUpsert")
 	defer func() {
 		if span != nil {
 			span.End()
@@ -618,7 +562,7 @@ func (s *server) StreamUpsert(stream vald.Vald_StreamUpsertServer) error {
 }
 
 func (s *server) MultiUpsert(ctx context.Context, vecs *payload.Object_Vectors) (*payload.Object_Locations, error) {
-	ctx, span := trace.StartSpan(ctx, "vald/gateway-vald.MultiUpsert")
+	ctx, span := trace.StartSpan(ctx, "vald/gateway-lb.MultiUpsert")
 	defer func() {
 		if span != nil {
 			span.End()
@@ -677,8 +621,8 @@ func (s *server) MultiUpsert(ctx context.Context, vecs *payload.Object_Vectors) 
 	return new(payload.Object_Locations), errs
 }
 
-func (s *server) Remove(ctx context.Context, id *payload.Object_ID) (*payload.Object_Locations, error) {
-	ctx, span := trace.StartSpan(ctx, "vald/gateway-vald.Remove")
+func (s *server) Remove(ctx context.Context, id *payload.Object_ID) (*payload.Object_Location, error) {
+	ctx, span := trace.StartSpan(ctx, "vald/gateway-lb.Remove")
 	defer func() {
 		if span != nil {
 			span.End()
@@ -703,10 +647,10 @@ func (s *server) Remove(ctx context.Context, id *payload.Object_ID) (*payload.Ob
 	for _, loc := range locs {
 		lmap[loc] = struct{}{}
 	}
-	err = s.gateway.BroadCast(ctx, func(ctx context.Context, target string, ac agent.AgentClient, copts ...grpc.CallOption) error {
+	err = s.gateway.BroadCast(ctx, func(ctx context.Context, target string, vc vald.ValdClient, copts ...grpc.CallOption) error {
 		_, ok := lmap[target]
 		if ok {
-			_, err = ac.Remove(ctx, &payload.Object_ID{
+			_, err = vc.Remove(ctx, &payload.Object_ID{
 				Id: uuid,
 			}, copts...)
 			if err != nil {
@@ -735,11 +679,11 @@ func (s *server) Remove(ctx context.Context, id *payload.Object_ID) (*payload.Ob
 		}
 		return nil, status.WrapWithInternal(fmt.Sprintf("Remove API failed to Remove backup uuid = %s", uuid), err, info.Get())
 	}
-	return new(payload.Object_Locations), nil
+	return new(payload.Object_Location), nil
 }
 
 func (s *server) StreamRemove(stream vald.Vald_StreamRemoveServer) error {
-	ctx, span := trace.StartSpan(stream.Context(), "vald/gateway-vald.StreamRemove")
+	ctx, span := trace.StartSpan(stream.Context(), "vald/gateway-lb.StreamRemove")
 	defer func() {
 		if span != nil {
 			span.End()
@@ -753,7 +697,7 @@ func (s *server) StreamRemove(stream vald.Vald_StreamRemoveServer) error {
 }
 
 func (s *server) MultiRemove(ctx context.Context, ids *payload.Object_IDs) (res *payload.Object_Locations, err error) {
-	ctx, span := trace.StartSpan(ctx, "vald/gateway-vald.MultiRemove")
+	ctx, span := trace.StartSpan(ctx, "vald/gateway-lb.MultiRemove")
 	defer func() {
 		if span != nil {
 			span.End()
@@ -776,10 +720,10 @@ func (s *server) MultiRemove(ctx context.Context, ids *payload.Object_IDs) (res 
 			lmap[loc] = append(lmap[loc], uuid)
 		}
 	}
-	err = s.gateway.BroadCast(ctx, func(ctx context.Context, target string, ac agent.AgentClient, copts ...grpc.CallOption) error {
+	err = s.gateway.BroadCast(ctx, func(ctx context.Context, target string, vc vald.ValdClient, copts ...grpc.CallOption) error {
 		uuids, ok := lmap[target]
 		if ok {
-			_, err := ac.MultiRemove(ctx, &payload.Object_IDs{
+			_, err := vc.MultiRemove(ctx, &payload.Object_IDs{
 				Ids: uuids,
 			}, copts...)
 			if err != nil {
@@ -811,8 +755,8 @@ func (s *server) MultiRemove(ctx context.Context, ids *payload.Object_IDs) (res 
 	return new(payload.Object_Locations), nil
 }
 
-func (s *server) GetObject(ctx context.Context, id *payload.Object_ID) (vec *payload.Object_Locations, err error) {
-	ctx, span := trace.StartSpan(ctx, "vald/gateway-vald.GetObject")
+func (s *server) GetObject(ctx context.Context, id *payload.Object_ID) (vec *payload.Object_Vector, err error) {
+	ctx, span := trace.StartSpan(ctx, "vald/gateway-lb.GetObject")
 	defer func() {
 		if span != nil {
 			span.End()
@@ -826,18 +770,22 @@ func (s *server) GetObject(ctx context.Context, id *payload.Object_ID) (vec *pay
 		}
 		return nil, status.WrapWithNotFound(fmt.Sprintf("GetObject API meta %s's uuid not found", meta), err, info.Get())
 	}
-	vec, err = s.backup.GetObject(ctx, uuid)
+	mvec, err := s.backup.GetObject(ctx, uuid)
 	if err != nil {
 		if span != nil {
 			span.SetStatus(trace.StatusCodeNotFound(err.Error()))
 		}
 		return nil, status.WrapWithNotFound(fmt.Sprintf("GetObject API meta %s uuid %s Object not found", meta, uuid), err, info.Get())
 	}
+	vec = &payload.Object_Vector{
+		Id:     mvec.GetUuid(),
+		Vector: mvec.GetVector(),
+	}
 	return vec, nil
 }
 
 func (s *server) StreamGetObject(stream vald.Vald_StreamGetObjectServer) error {
-	ctx, span := trace.StartSpan(stream.Context(), "vald/gateway-vald.StreamGetObject")
+	ctx, span := trace.StartSpan(stream.Context(), "vald/gateway-lb.StreamGetObject")
 	defer func() {
 		if span != nil {
 			span.End()
